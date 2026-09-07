@@ -661,6 +661,10 @@ const NON_RETRYABLE_CONNECT_ERROR_CODES = new Set([
   "studio.upstream_error",
   "studio.upstream_timeout",
   "studio.upstream_rejected",
+  "studio.gateway_unreachable",
+  "studio.gateway_invalid_token",
+  "studio.gateway_protocol_mismatch",
+  "studio.gateway_scope_missing",
 ]);
 
 const isNonRetryableConnectErrorCode = (code: string | null): boolean => {

@@ -696,8 +696,7 @@ describe("createGatewayProxy", () => {
         id: "connect-pairing-required",
         ok: false,
         error: {
-          code: "studio.upstream_rejected",
-          message: "Upstream gateway rejected connect (1008): pairing required",
+          code: "studio.gateway_approval_required",
         },
       });
     } finally {

@@ -1,5 +1,6 @@
 const { Buffer } = require("node:buffer");
 const { WebSocket, WebSocketServer } = require("ws");
+const { classifyUpstreamFailure, classifyOperatorScopes } = require("./gateway-diagnostics");
 
 const DEFAULT_UPSTREAM_HANDSHAKE_TIMEOUT_MS = 10_000;
 
@@ -228,14 +229,24 @@ function createGatewayProxy(options) {
     };
 
     const forwardConnectFrame = (frame) => {
-      const browserHasAuth =
+      // Two distinct predicates:
+      //  - browserHasAnyAuth: does the browser present ANY usable credential
+      //    (shared secret OR a device-auth signature)? A previously-paired
+      //    device authenticates via its ed25519 signature alone, so this
+      //    governs whether we can proceed without a host token at all.
+      //  - browserHasSharedSecret: did the browser supply its OWN shared
+      //    secret (token/password/previously-issued deviceToken)? A bare
+      //    device signature is NOT a shared secret: on FIRST pairing the
+      //    gateway still needs the shared bootstrap token, so a device
+      //    signature must not suppress server-side token injection.
+      const browserHasSharedSecret =
         hasNonEmptyToken(frame.params) ||
         hasNonEmptyPassword(frame.params) ||
-        hasNonEmptyDeviceToken(frame.params) ||
-        hasCompleteDeviceAuth(frame.params);
+        hasNonEmptyDeviceToken(frame.params);
+      const browserHasAnyAuth = browserHasSharedSecret || hasCompleteDeviceAuth(frame.params);
 
       const requiresToken = upstreamAdapterType === "openclaw";
-      if (requiresToken && !upstreamToken && !browserHasAuth) {
+      if (requiresToken && !upstreamToken && !browserHasAnyAuth) {
         sendConnectError(
           "studio.gateway_token_missing",
           "Upstream gateway token is not configured on the Studio host."
@@ -243,12 +254,13 @@ function createGatewayProxy(options) {
         return;
       }
 
-      const baseConnectFrame = browserHasAuth
-        ? frame
-        : {
-            ...frame,
-            params: injectAuthToken(frame.params, upstreamToken),
-          };
+      const baseConnectFrame =
+        !browserHasSharedSecret && upstreamToken
+          ? {
+              ...frame,
+              params: injectAuthToken(frame.params, upstreamToken),
+            }
+          : frame;
 
       const connectParams = isObject(baseConnectFrame.params)
         ? { ...baseConnectFrame.params }
@@ -359,15 +371,46 @@ function createGatewayProxy(options) {
       });
 
       upstreamWs.on("message", (upRaw) => {
-        const upParsed = safeJsonParse(String(upRaw ?? ""));
+        const text = String(upRaw ?? "");
+        const upParsed = safeJsonParse(text);
         if (upParsed && isObject(upParsed) && upParsed.type === "res") {
           const resId = typeof upParsed.id === "string" ? upParsed.id : "";
-          if (resId && connectRequestId && resId === connectRequestId) {
+          if (resId && connectRequestId && resId === connectRequestId && !connectResponseSent) {
             connectResponseSent = true;
+
+            // Upstream rejected the connect handshake — translate the raw
+            // gateway error into an actionable diagnostic before forwarding.
+            if (upParsed.ok === false) {
+              const rawError = isObject(upParsed.error) ? upParsed.error : {};
+              const diag = classifyUpstreamFailure({
+                kind: "res",
+                errorCode: typeof rawError.code === "string" ? rawError.code : undefined,
+                errorMessage: typeof rawError.message === "string" ? rawError.message : undefined,
+              });
+              log(`[gateway-proxy] upstream connect rejected -> ${diag.code}`);
+              sendToBrowser(buildErrorResponse(connectRequestId, diag.code, diag.message));
+              closeBoth(1011, "connect failed");
+              return;
+            }
+
+            // Connect succeeded — verify the granted session carries operator
+            // scopes so agent management actually works.
+            const scopeCheck = classifyOperatorScopes(upParsed.payload);
+            if (!scopeCheck.ok) {
+              log(`[gateway-proxy] upstream connect succeeded without operator scopes`);
+              sendToBrowser(buildErrorResponse(connectRequestId, scopeCheck.code, scopeCheck.message));
+              closeBoth(1011, "connect failed");
+              return;
+            }
+
+            if (browserWs.readyState === WebSocket.OPEN) {
+              browserWs.send(text);
+            }
+            return;
           }
         }
         if (browserWs.readyState === WebSocket.OPEN) {
-          browserWs.send(String(upRaw ?? ""));
+          browserWs.send(text);
         }
       });
 
@@ -385,24 +428,14 @@ function createGatewayProxy(options) {
         log(
           `[gateway-proxy] upstream closed code=${code} reason=${reason || "(none)"} hadConnect=${Boolean(connectRequestId)} responseSent=${connectResponseSent}`
         );
+        const diag = classifyUpstreamFailure({ kind: "close", wsCode: code, reason });
         if (!connectRequestId) {
-          pendingUpstreamSetupError ||= {
-            code: "studio.upstream_closed",
-            message: `Upstream gateway closed (${code}): ${reason}`,
-          };
+          pendingUpstreamSetupError ||= diag;
           return;
         }
         if (!connectResponseSent && connectRequestId) {
           connectResponseSent = true;
-          sendToBrowser(
-            buildErrorResponse(
-              connectRequestId,
-              code === 1008 ? "studio.upstream_rejected" : "studio.upstream_closed",
-              code === 1008
-                ? `Upstream gateway rejected connect (${code}): ${reason || "no reason provided"}`
-                : `Upstream gateway closed (${code}): ${reason}`
-            )
-          );
+          sendToBrowser(buildErrorResponse(connectRequestId, diag.code, diag.message));
           return;
         }
         closeBoth(1012, "upstream closed");
@@ -414,11 +447,13 @@ function createGatewayProxy(options) {
           upstreamHandshakeTimeoutId = null;
         }
         logError("Upstream gateway WebSocket error.", err);
+        const diag = classifyUpstreamFailure({
+          kind: "socket",
+          errorCode: err && typeof err === "object" ? err.code : undefined,
+          errorMessage: err instanceof Error ? err.message : String(err ?? ""),
+        });
         if (!connectRequestId) {
-          pendingUpstreamSetupError ||= {
-            code: "studio.upstream_error",
-            message: "Failed to connect to upstream gateway WebSocket.",
-          };
+          pendingUpstreamSetupError ||= diag;
           return;
         }
         if (
@@ -428,10 +463,7 @@ function createGatewayProxy(options) {
           sendConnectError(pendingUpstreamSetupError.code, pendingUpstreamSetupError.message);
           return;
         }
-        sendConnectError(
-          "studio.upstream_error",
-          "Failed to connect to upstream gateway WebSocket."
-        );
+        sendConnectError(diag.code, diag.message);
       });
 
       log("proxy connected");
